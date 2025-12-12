@@ -11,11 +11,16 @@ use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
 use OpenTelemetry\Context\Context;
 use function OpenTelemetry\Instrumentation\hook;
-use OpenTelemetry\SemConv\TraceAttributes;
+use OpenTelemetry\SDK\Trace\ReadableSpanInterface;
+use OpenTelemetry\SemConv\Attributes\CodeAttributes;
+use OpenTelemetry\SemConv\Attributes\HttpAttributes;
+use OpenTelemetry\SemConv\Attributes\NetworkAttributes;
+use OpenTelemetry\SemConv\Attributes\UrlAttributes;
+use OpenTelemetry\SemConv\Incubating\Attributes\HttpIncubatingAttributes;
+use yii\base\Application;
+use yii\base\Controller;
 use yii\base\InlineAction;
-use yii\web\Application;
-use yii\web\Controller;
-use yii\web\Response;
+use yii\base\Response;
 
 class YiiInstrumentation
 {
@@ -31,6 +36,63 @@ class YiiInstrumentation
 
         hook(
             Application::class,
+            'run',
+            pre: static function (
+                Application $application,
+                array $params,
+                string $class,
+                string $function,
+                ?string $filename,
+                ?int $lineno,
+            ) use ($instrumentation) : void {
+                $request = $application->getRequest();
+                if ($request->getIsConsoleRequest()) {
+                    $parent = Context::getCurrent();
+                    $spanName = 'yii_cli_run';
+                } else {
+                    $parent = Globals::propagator()->extract($request, RequestPropagationGetter::instance());
+                    $spanName = 'yii_web_run';
+                }
+
+                /** @psalm-suppress ArgumentTypeCoercion */
+                $spanBuilder = $instrumentation
+                    ->tracer()
+                    ->spanBuilder($spanName)
+                    ->setParent($parent)
+                    ->setSpanKind(SpanKind::KIND_SERVER)
+                    ->setAttribute(CodeAttributes::CODE_FUNCTION_NAME, sprintf('%s::%s', $class, $function))
+                    ->setAttribute(CodeAttributes::CODE_FILE_PATH, $filename)
+                    ->setAttribute(CodeAttributes::CODE_LINE_NUMBER, $lineno);
+
+                $span = $spanBuilder->startSpan();
+
+                Context::storage()->attach($span->storeInContext($parent));
+            },
+            post: static function (
+                Application $application,
+                array $params,
+                mixed $result,
+                ?\Throwable $exception
+            ): void {
+                $scope = Context::storage()->scope();
+                if (!$scope) {
+                    return;
+                }
+                $scope->detach();
+
+                $span = Span::fromContext($scope->context());
+
+                if ($exception) {
+                    $span->recordException($exception);
+                    $span->setStatus(StatusCode::STATUS_ERROR, $exception->getMessage());
+                }
+
+                $span->end();
+            }
+        );
+
+        hook(
+            Application::class,
             'handleRequest',
             pre: static function (
                 Application $application,
@@ -41,21 +103,26 @@ class YiiInstrumentation
                 ?int $lineno,
             ) use ($instrumentation) : void {
                 $request = $application->getRequest();
-                $parent = Globals::propagator()->extract($request, RequestPropagationGetter::instance());
+                $parent = Context::getCurrent();
+
+                $spanName = $request->getIsConsoleRequest() ? 'RUN' : $request->getMethod();
 
                 /** @psalm-suppress ArgumentTypeCoercion */
                 $spanBuilder = $instrumentation
                     ->tracer()
-                    ->spanBuilder(sprintf('%s', $request->getMethod()))
+                    ->spanBuilder($spanName)
                     ->setParent($parent)
-                    ->setSpanKind(SpanKind::KIND_SERVER)
-                    ->setAttribute(TraceAttributes::CODE_FUNCTION_NAME, sprintf('%s::%s', $class, $function))
-                    ->setAttribute(TraceAttributes::CODE_FILE_PATH, $filename)
-                    ->setAttribute(TraceAttributes::CODE_LINE_NUMBER, $lineno)
-                    ->setAttribute(TraceAttributes::URL_FULL, $request->getAbsoluteUrl())
-                    ->setAttribute(TraceAttributes::HTTP_REQUEST_METHOD, $request->getMethod())
-                    ->setAttribute(TraceAttributes::HTTP_REQUEST_BODY_SIZE, $request->getHeaders()->get('Content-Length', null, true))
-                    ->setAttribute(TraceAttributes::URL_SCHEME, $request->getIsSecureConnection() ? 'https' : 'http');
+                    ->setSpanKind($request->getIsConsoleRequest() ? SpanKind::KIND_INTERNAL : SpanKind::KIND_SERVER)
+                    ->setAttribute(CodeAttributes::CODE_FUNCTION_NAME, sprintf('%s::%s', $class, $function))
+                    ->setAttribute(CodeAttributes::CODE_FILE_PATH, $filename)
+                    ->setAttribute(CodeAttributes::CODE_LINE_NUMBER, $lineno);
+
+                if (!$request->getIsConsoleRequest()) {
+                    $spanBuilder->setAttribute(UrlAttributes::URL_FULL, $request->getAbsoluteUrl())
+                        ->setAttribute(HttpAttributes::HTTP_REQUEST_METHOD, $request->getMethod())
+                        ->setAttribute(HttpIncubatingAttributes::HTTP_REQUEST_BODY_SIZE, $request->getHeaders()->get('Content-Length', null, true))
+                        ->setAttribute(UrlAttributes::URL_SCHEME, $request->getIsSecureConnection() ? 'https' : 'http');
+                }
 
                 $span = $spanBuilder->startSpan();
 
@@ -75,18 +142,20 @@ class YiiInstrumentation
 
                 $span = Span::fromContext($scope->context());
 
-                if ($response) {
+                if ($response instanceof \yii\web\Response) {
                     $statusCode = $response->getStatusCode();
-                    $span->setAttribute(TraceAttributes::HTTP_RESPONSE_STATUS_CODE, $statusCode);
-                    $span->setAttribute(TraceAttributes::NETWORK_PROTOCOL_VERSION, $response->version);
-                    $span->setAttribute(TraceAttributes::HTTP_RESPONSE_BODY_SIZE, YiiInstrumentation::getResponseLength($response));
+                    $span->setAttribute(HttpAttributes::HTTP_RESPONSE_STATUS_CODE, $statusCode);
+                    $span->setAttribute(NetworkAttributes::NETWORK_PROTOCOL_VERSION, $response->version);
+                    $span->setAttribute(HttpIncubatingAttributes::HTTP_RESPONSE_BODY_SIZE, self::getResponseLength($response));
 
                     $headers = $response->getHeaders();
-
                     foreach ((array) (get_cfg_var('otel.instrumentation.http.response_headers') ?: []) as $header) {
                         if ($headers->has($header)) {
                             /** @psalm-suppress ArgumentTypeCoercion */
-                            $span->setAttribute(sprintf('http.response.header.%s', strtr(strtolower($header), ['-' => '_'])), $headers->get($header, null, true));
+                            $span->setAttribute(
+                                sprintf('%s.%s', HttpAttributes::HTTP_RESPONSE_HEADER, strtr(strtolower($header), ['-' => '_'])),
+                                $headers->get($header, null, true)
+                            );
                         }
                     }
 
@@ -109,39 +178,25 @@ class YiiInstrumentation
 
         hook(
             Controller::class,
-            'beforeAction',
-            pre: static function (
+            'runAction',
+            post: static function (
                 Controller $controller,
-                array $params,
-                string $class,
-                string $function,
-                ?string $filename,
-                ?int $lineno,
             ) : void {
-                $action = $params[0] ?? null;
                 $scope = Context::storage()->scope();
-                if (!$action || !$scope) {
+                if (!$scope) {
                     return;
                 }
 
                 $span = Span::fromContext($scope->context());
-                $actionName = $action instanceof InlineAction ? $action->actionMethod : $action->id;
-                $route = YiiInstrumentation::normalizeRouteName(get_class($controller), $actionName);
+                $span->updateName(($span instanceof ReadableSpanInterface ? $span->getName() . ' ' : '') . \Yii::$app->requestedRoute);
 
-                // Get the HTTP method from the request
-                $request = $controller->request;
-                $method = $request->getMethod();
-
-                /** @psalm-suppress ArgumentTypeCoercion */
-                // Update span name to follow OpenTelemetry HTTP naming convention: {http.method} {http.route}
-                $span->updateName(sprintf('%s %s', $method, $route));
-                $span->setAttribute(TraceAttributes::HTTP_ROUTE, $route);
-            },
-            post: null
+                $action = $controller->action;
+                $span->setAttribute(HttpAttributes::HTTP_ROUTE, get_class($controller) . ($action instanceof InlineAction ? '::' . $action->actionMethod : ' - ' . get_class($action)));
+            }
         );
     }
 
-    protected static function getResponseLength(Response $response): ?string
+    protected static function getResponseLength(\yii\web\Response $response): ?string
     {
         $headerValue = $response->getHeaders()->get('Content-Length', null, true);
         if (is_string($headerValue)) {
@@ -153,16 +208,5 @@ class YiiInstrumentation
         }
 
         return null;
-    }
-
-    protected static function normalizeRouteName(string $controllerClassName, string $actionName): string
-    {
-        $lastSegment = strrchr($controllerClassName, '\\');
-
-        if ($lastSegment === false) {
-            return $controllerClassName . '.' . $actionName;
-        }
-
-        return substr($lastSegment, 1) . '.' . $actionName;
     }
 }
