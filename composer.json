@@ -1,5 +1,5 @@
 {
-    "name": "open-telemetry/opentelemetry-auto-yii",
+    "name": "sagacorp/opentelemetry-auto-yii",
     "description": "OpenTelemetry auto-instrumentation for Yii",
     "keywords": ["opentelemetry", "otel", "open-telemetry", "tracing", "yii", "instrumentation"],
     "type": "library",
@@ -27,6 +27,9 @@
       "psalm/plugin-phpunit": "^0.19.2",
       "phpunit/phpunit": "^9.5",
       "vimeo/psalm": "6.4.0"
+    },
+    "replace": {
+      "open-telemetry/opentelemetry-auto-yii":"0.2.0"
     },
     "repositories": [
       {
